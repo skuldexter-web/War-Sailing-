@@ -51,13 +51,12 @@ print_banner() {
     clear
     printf '%s' "${C_GOLD}${C_BOLD}"
     cat <<'BANNER'
-█     █  ███  ████     ████  ███  █████ █     █████ █   █  ████
-█     █ █   █ █   █    █    █   █   █   █     █     ██  █ █    
-█     █ █   █ █   █    █    █   █   █   █     █     █ █ █ █    
-█ █ █ █ █████ ████      ███ █████   █   █     █████ █ █ █ █ ███
-█ █ █ █ █   █ █ █       █    █   █   █   █     █     █  ██ █   █
-██ █ ██ █   █ █  █          █ █   █   █   █     █     █   █ █   █
-█     █ █   █ █   █    ████ █   █   █   █████ █████ █   █  ████
+   ██╗    ██╗ █████╗ ██████╗     ███████╗ █████╗ ██╗██╗     ██╗███╗   ██╗ ██████╗
+   ██║    ██║██╔══██╗██╔══██╗    ██╔════╝██╔══██╗██║██║     ██║████╗  ██║██╔════╝
+   ██║ █╗ ██║███████║██████╔╝    ███████╗███████║██║██║     ██║██╔██╗ ██║██║     
+   ██║███╗██║██╔══██║██╔══██╗    ╚════██║██╔══██║██║██║     ██║██║╚██╗██║██║  ███
+   ╚███╔███╔╝██║  ██║██║  ██║    ███████║██║  ██║██║███████╗██║██║ ╚████║╚██████╔╝
+    ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝  ╚═╝    ╚══════╝╚═╝  ╚═╝╚═╝╚══════╝╚═╝╚═╝  ╚═══╝ ╚═════╝ 
 BANNER
     printf '%s\n' "${C_RESET}"
     printf "%s          \"LETS EXPLORE THE 7 SEA'S AND CONQUER FOR WALHALLA\"%s\n\n" "${C_STEEL}${C_BOLD}" "${C_RESET}"
@@ -126,10 +125,10 @@ def get_ssid_and_channel(pkt, stats):
     if not ssid or channel == 0:
         el = pkt[Dot11Elt]
         while el:
-            if el.ID == 0: # SSID
+            if el.ID == 0:
                 try: ssid = el.info.decode('utf-8', errors='replace')
                 except Exception: pass
-            elif el.ID == 3: # DS Set (Channel)
+            elif el.ID == 3:
                 try: channel = int(el.info[0])
                 except Exception: pass
             el = el.payload.getlayer(Dot11Elt)
