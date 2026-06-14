@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 readonly APP_NAME="WAR SAILING"
-readonly APP_VERSION="1.2.3"
+readonly APP_VERSION="1.2.4"
 readonly DATA_DIR="${HOME}/.warsailing"
 readonly LOG_DIR="${DATA_DIR}/logs"
 readonly BIN_DIR="${DATA_DIR}/bin"
@@ -327,14 +327,30 @@ stop_gpsd_if_we_started_it() {
 }
 
 get_gps_fix() {
-    local json
-    # Filter null-bytes instantly from the serial/gpspipe buffer stream
-    json=$(timeout 2 gpspipe -w -n 15 2>/dev/null | tr -d '\0' | grep -m1 '"class":"TPV"' || true)
+    local raw_json json lat lon alt acc
+    # Haal de rauwe data op en strip direct ALLES wat geen legitiem karakter is om Bash-waarschuwingen te voorkomen
+    raw_json=$(timeout 2 gpspipe -w -n 15 2>/dev/null | tr -d '\0' | grep -m1 '"class":"TPV"' || true)
+    
+    # Valideer string en zorg dat deze geen verborgen rotzooi bevat
+    json=$(echo -n "$raw_json" | tr -cd '[:print:]' || true)
+
     if [[ -z "$json" ]]; then
-        printf '%s' "0.000000,0.000000,0.0,0.0"
+        printf '%s' "SIGNAL_LOSS,SIGNAL_LOSS,0.0,0.0"
         return
     fi
-    printf '%s,%s,%s,%s' "$(echo "$json" | jq -r '.lat // 0')" "$(echo "$json" | jq -r '.lon // 0')" "$(echo "$json" | jq -r '.alt // 0')" "$(echo "$json" | jq -r '.epx // .eph // 0')"
+
+    lat=$(echo "$json" | jq -r '.lat // "SIGNAL_LOSS"' 2>/dev/null | tr -d '\0')
+    lon=$(echo "$json" | jq -r '.lon // "SIGNAL_LOSS"' 2>/dev/null | tr -d '\0')
+    alt=$(echo "$json" | jq -r '.alt // "0.0"' 2>/dev/null | tr -d '\0')
+    acc=$(echo "$json" | jq -r '.epx // .eph // "0.0"' 2>/dev/null | tr -d '\0')
+
+    # Ultieme fallback-beveiliging tegen null-strings
+    [[ -z "$lat" || "$lat" == "null" ]] && lat="SIGNAL_LOSS"
+    [[ -z "$lon" || "$lon" == "null" ]] && lon="SIGNAL_LOSS"
+    [[ -z "$alt" || "$alt" == "null" ]] && alt="0.0"
+    [[ -z "$acc" || "$acc" == "null" ]] && acc="0.0"
+
+    printf '%s,%s,%s,%s' "$lat" "$lon" "$alt" "$acc"
 }
 
 detect_wlan_interfaces() {
@@ -416,24 +432,37 @@ run_loot_feed() {
     SEEN_BSSIDS=()
     SCAN_COUNT=0
 
-    while IFS= read -r line; do
+    # Stream opschonen van alle verborgen null-bytes of non-printable karakters
+    while IFS= read -r raw_line; do
+        local line
+        line=$(echo -n "$raw_line" | tr -cd '[:print:]' || true)
         [[ -z "$line" ]] && continue
+        
         local bssid ssid channel rssi auth
-        bssid=$(echo "$line" | jq -r '.bssid // empty')
+        bssid=$(echo "$line" | jq -r '.bssid // empty' 2>/dev/null)
         [[ -z "$bssid" ]] && continue
         [[ -n "${SEEN_BSSIDS[$bssid]:-}" ]] && continue
         SEEN_BSSIDS[$bssid]=1
         SCAN_COUNT=$((SCAN_COUNT + 1))
 
-        ssid=$(echo "$line" | jq -r '.ssid // ""')
-        channel=$(echo "$line" | jq -r '.channel // 0')
-        rssi=$(echo "$line" | jq -r '.rssi // -100')
-        auth=$(echo "$line" | jq -r '.auth // "[UNKNOWN]"')
+        ssid=$(echo "$line" | jq -r '.ssid // ""' 2>/dev/null | tr -cd '[:print:]')
+        channel=$(echo "$line" | jq -r '.channel // 0' 2>/dev/null)
+        rssi=$(echo "$line" | jq -r '.rssi // -100' 2>/dev/null)
+        auth=$(echo "$line" | jq -r '.auth // "[UNKNOWN]"' 2>/dev/null)
 
+        # Haal de schone GPS-data op
         local lat lon alt acc gps_fix
         gps_fix=$(get_gps_fix)
         IFS=',' read -r lat lon alt acc <<< "$gps_fix"
-        printf '%s,"%s",%s,%s,%s,%s,%s,%s,%s,%s,WIFI\n' "$bssid" "$ssid" "$auth" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$channel" "$rssi" "$lat" "$lon" "$alt" "$acc" >> "$CURRENT_LOG_FILE"
+
+        # Schrijf netjes naar de WigleCSV (als er geen signaal is, zetten we 0.0 neer om de kaart te sparen)
+        local log_lat="$lat" log_lon="$lon"
+        if [[ "$lat" == "SIGNAL_LOSS" || "$lon" == "SIGNAL_LOSS" ]]; then
+            log_lat="0.000000"
+            log_lon="0.000000"
+        fi
+
+        printf '%s,"%s",%s,%s,%s,%s,%s,%s,%s,%s,WIFI\n' "$bssid" "$ssid" "$auth" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$channel" "$rssi" "$log_lat" "$log_lon" "$alt" "$acc" >> "$CURRENT_LOG_FILE"
 
         local rssi_color="$C_STEEL"
         if   (( rssi >= -50 )); then rssi_color="$C_GREEN"
@@ -441,9 +470,17 @@ run_loot_feed() {
         else                          rssi_color="$C_BLOOD"
         fi
 
-        printf "${C_OCEAN}[%4d]${C_RESET} ${C_GOLD}%-14.14s${C_RESET} ${C_STEEL}%s${C_RESET} ch:${C_FOAM}%-2s${C_RESET} rssi:${rssi_color}%4s${C_RESET}\n" \
-            "$SCAN_COUNT" "${ssid:-<hidden>}" "$bssid" "$channel" "$rssi"
-    done < <("${VENV_DIR}/bin/python3" "$SCAN_ENGINE" "$iface" 2>/dev/null | tr -d '\0')
+        # Dynamische weergave in de cockpit: toon SIGNAL LOSS als de coördinaten corrupt waren
+        local gps_display
+        if [[ "$lat" == "SIGNAL_LOSS" ]]; then
+            gps_display="${C_BLOOD}[SIGNAL LOSS]${C_RESET}"
+        else
+            gps_display="${C_GREEN}Fix: ${lat:0:7},${lon:0:7}${C_RESET}"
+        fi
+
+        printf "${C_OCEAN}[%4d]${C_RESET} ${C_GOLD}%-14.14s${C_RESET} ${C_STEEL}%s${C_RESET} ch:${C_FOAM}%-2s${C_RESET} %s\n" \
+            "$SCAN_COUNT" "${ssid:-<hidden>}" "$bssid" "$channel" "$gps_display"
+    done < <("${VENV_DIR}/bin/python3" "$SCAN_ENGINE" "$iface" 2>/dev/null)
 }
 
 expedition_cleanup() {
