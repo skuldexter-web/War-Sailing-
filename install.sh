@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 readonly APP_NAME="WAR SAILING"
-readonly APP_VERSION="1.1.0"
+readonly APP_VERSION="1.2.2"
 readonly DATA_DIR="${HOME}/.warsailing"
 readonly LOG_DIR="${DATA_DIR}/logs"
 readonly BIN_DIR="${DATA_DIR}/bin"
@@ -11,8 +11,9 @@ readonly VENV_DIR="${DATA_DIR}/venv"
 readonly STATE_DIR="${DATA_DIR}/run"
 readonly INSTALL_MARKER="${DATA_DIR}/.installed"
 readonly SCAN_ENGINE="${BIN_DIR}/scan_engine.py"
+readonly SYSTEM_BIN="/usr/local/bin/war-sailing"
 
-readonly APT_PACKAGES=(gpsd gpsd-clients iw wireless-tools aircrack-ng tshark jq python3 python3-venv python3-pip libpcap-dev)
+readonly APT_PACKAGES=(gpsd gpsd-clients iw wireless-tools aircrack-ng tshark jq python3 python3-venv python3-pip libpcap-dev git)
 
 GPSD_DEVICE=""
 WE_STARTED_GPSD=0
@@ -41,7 +42,7 @@ command_exists() { command -v "$1" &>/dev/null; }
 
 require_root() {
     if [[ "$(id -u)" -ne 0 ]]; then
-        log_error "This action requires root. Re-run with: sudo $0"
+        log_error "This action requires root. Re-run with: sudo war-sailing of sudo $0"
         return 1
     fi
     return 0
@@ -49,8 +50,13 @@ require_root() {
 
 print_banner() {
     clear
-    printf '%s' "${C_GOLD}${C_BOLD}"
-    cat <<'BANNER'
+    local cols
+    cols=$(tput cols 2>/dev/null || echo 80)
+    
+    # Als het scherm groot genoeg is (minimaal 80 tekens), tonen we de grote banner
+    if (( cols >= 80 )); then
+        printf '%s' "${C_GOLD}${C_BOLD}"
+        cat <<'BANNER'
    ██╗    ██╗ █████╗ ██████╗     ███████╗ █████╗ ██╗██╗     ██╗███╗   ██╗ ██████╗
    ██║    ██║██╔══██╗██╔══██╗    ██╔════╝██╔══██╗██║██║     ██║████╗  ██║██╔════╝
    ██║ █╗ ██║███████║██████╔╝    ███████╗███████║██║██║     ██║██╔██╗ ██║██║     
@@ -58,8 +64,26 @@ print_banner() {
    ╚███╔███╔╝██║  ██║██║  ██║    ███████║██║  ██║██║███████╗██║██║ ╚████║╚██████╔╝
     ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝  ╚═╝    ╚══════╝╚═╝  ╚═╝╚═╝╚══════╝╚═╝╚═╝  ╚═══╝ ╚═════╝ 
 BANNER
-    printf '%s\n' "${C_RESET}"
-    printf "%s          \"LETS EXPLORE THE 7 SEA'S AND CONQUER FOR WALHALLA\"%s\n\n" "${C_STEEL}${C_BOLD}" "${C_RESET}"
+        printf '%s\n' "${C_RESET}"
+        printf "%s          \"LETS EXPLORE THE 7 SEA'S AND CONQUER FOR WALHALLA\"%s\n\n" "${C_STEEL}${C_BOLD}" "${C_RESET}"
+    else
+        # Is het scherm te klein (zoals de 3.5" Pi)? Dan gebruiken we de compacte, veilige layout
+        (( cols < 40 )) && cols=40
+        printf '%s' "${C_OCEAN}"
+        printf '%*s\n' "$cols" '' | tr ' ' '='
+        
+        printf '%s' "${C_GOLD}${C_BOLD}"
+        local title="--- ${APP_NAME} v${APP_VERSION} ---"
+        printf "%*s\n" $(( (${#title} + cols) / 2 )) "$title"
+        
+        printf '%s' "${C_STEEL}"
+        local sub="WALHALLA IS AWAITING"
+        printf "%*s\n" $(( (${#sub} + cols) / 2 )) "$sub"
+        
+        printf '%s' "${C_OCEAN}"
+        printf '%*s\n' "$cols" '' | tr ' ' '='
+        printf '%s\n' "${C_RESET}"
+    fi
 }
 
 detect_distro() {
@@ -80,6 +104,19 @@ assert_debian_based() {
             log_warn "Unrecognized distro '${distro}' — continuing, but apt may fail."
             ;;
     esac
+}
+
+create_global_link() {
+    log_info "Creating global system shortcut..."
+    local script_path
+    script_path=$(realpath "$0")
+    
+    cat > "$SYSTEM_BIN" <<EOF
+#!/usr/bin/env bash
+exec "$script_path" "\$@"
+EOF
+    chmod +x "$SYSTEM_BIN"
+    log_ok "Shortcut available! You can now just type: sudo war-sailing"
 }
 
 setup_python_venv() {
@@ -217,9 +254,38 @@ install_dependencies() {
 
     setup_python_venv
     write_scan_engine
+    create_global_link
     mkdir -p "$LOG_DIR" "$STATE_DIR"
     touch "$INSTALL_MARKER"
     log_ok "Setup complete."
+}
+
+update_tool() {
+    log_info "Checking tactical updates from GitHub..."
+    local dir
+    dir=$(dirname "$(realpath "$0")")
+    cd "$dir"
+    
+    if [[ ! -d .git ]]; then
+        log_error "This tool was not cloned via git. Cannot auto-update."
+        return 1
+    fi
+
+    git fetch --tags origin
+    local local_branch
+    local_branch=$(git rev-parse --abbrev-ref HEAD)
+    
+    log_info "Pulling newest code changes..."
+    if git pull origin "$local_branch"; then
+        log_ok "Code pulled successfully. Re-running core engines..."
+        write_scan_engine
+        create_global_link
+        log_ok "Update complete! Restating tactical interface..."
+        sleep 1
+        exec "$0" --run
+    else
+        log_error "Failed to pull data from GitHub. Verify your network link."
+    fi
 }
 
 detect_gps_devices() {
@@ -375,9 +441,9 @@ run_loot_feed() {
         else                          rssi_color="$C_BLOOD"
         fi
 
-        printf "${C_OCEAN}[%4d]${C_RESET} ${C_GOLD}%-24s${C_RESET} ${C_STEEL}%s${C_RESET} ch:${C_FOAM}%-3s${C_RESET} rssi:${rssi_color}%4s dBm${C_RESET} @ ${C_OCEAN_LT}%.5f,%.5f${C_RESET}\n" \
-            "$SCAN_COUNT" "${ssid:-<hidden>}" "$bssid" "$channel" "$rssi" "$lat" "$lon"
-    done < <("${VENV_DIR}/bin/python3" "$SCAN_ENGINE" "$iface" 2>/dev/null)
+        printf "${C_OCEAN}[%4d]${C_RESET} ${C_GOLD}%-14.14s${C_RESET} ${C_STEEL}%s${C_RESET} ch:${C_FOAM}%-2s${C_RESET} rssi:${rssi_color}%4s${C_RESET}\n" \
+            "$SCAN_COUNT" "${ssid:-<hidden>}" "$bssid" "$channel" "$rssi"
+    done < <("${VENV_DIR}/bin/python3" "$SCAN_ENGINE" "$iface" 2>/dev/null | tr -d '\0')
 }
 
 expedition_cleanup() {
@@ -441,7 +507,7 @@ menu_view_logs() {
         count=$(( $(wc -l < "$f") - 2 ))
         (( count < 0 )) && count=0
         f_date=$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "unknown")
-        printf "  %s[%2d]%s %-32s ${C_STEEL}(%d APs, %s)${C_RESET}\n" "$C_OCEAN_LT" "$i" "$C_RESET" "$(basename "$f")" "$count" "$f_date"
+        printf "  %s[%2d]%s %-24s ${C_STEEL}(%d APs)${C_RESET}\n" "$C_OCEAN_LT" "$i" "$C_RESET" "$(basename "$f")" "$count"
         i=$((i + 1))
     done
 
@@ -458,19 +524,20 @@ menu_view_logs() {
 main_menu() {
     while true; do
         print_banner
-        echo -e "${C_STEEL}Base: ${C_GOLD}${DATA_DIR}${C_RESET}\n"
         echo -e "  ${C_OCEAN_LT}${C_BOLD}[1]${C_RESET} Start Expedition (Scan)"
         echo -e "  ${C_OCEAN_LT}${C_BOLD}[2]${C_RESET} Stop & Secure Sails"
         echo -e "  ${C_OCEAN_LT}${C_BOLD}[3]${C_RESET} View Saved Logs"
-        echo -e "  ${C_OCEAN_LT}${C_BOLD}[4]${C_RESET} Exit"
+        echo -e "  ${C_OCEAN_LT}${C_BOLD}[4]${C_RESET} Update Tool from GitHub"
+        echo -e "  ${C_OCEAN_LT}${C_BOLD}[5]${C_RESET} Exit"
         echo
         local choice
-        read -rp "$(printf '%sChoose your fate, Viking: %s' "$C_GOLD" "$C_RESET")" choice || choice=4
+        read -rp "$(printf '%sChoose your fate, Viking: %s' "$C_GOLD" "$C_RESET")" choice || choice=5
         case "$choice" in
             1) menu_start_expedition ;;
             2) menu_stop_and_secure; read -rp "Press Enter to continue..." _ || true ;;
             3) menu_view_logs ;;
-            4) log_info "Fair winds. Walhalla awaits."; exit 0 ;;
+            4) update_tool; read -rp "Press Enter to continue..." _ || true ;;
+            5) log_info "Fair winds. Walhalla awaits."; exit 0 ;;
             *) log_warn "Invalid selection."; sleep 1 ;;
         esac
     done
@@ -480,10 +547,11 @@ main() {
     mkdir -p "$DATA_DIR" "$LOG_DIR" "$STATE_DIR" "$BIN_DIR"
     case "${1:-}" in
         --install) print_banner; install_dependencies; exit 0 ;;
+        --update) update_tool; exit 0 ;;
         --run) : ;;
-        -h|--help) print_banner; echo "Usage: $0 [--install | --run | --help]"; exit 0 ;;
+        -h|--help) print_banner; echo "Usage: $0 [--install | --update | --run | --help]"; exit 0 ;;
         "") if [[ ! -f "$INSTALL_MARKER" ]]; then print_banner; log_warn "First launch: deploying dependencies."; install_dependencies; fi ;;
-        *) echo "Usage: $0 [--install | --run]"; exit 1 ;;
+        *) echo "Usage: $0 [--install | --update | --run]"; exit 1 ;;
     esac
     main_menu
 }
