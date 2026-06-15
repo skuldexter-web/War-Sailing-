@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 readonly APP_NAME="WAR SAILING"
-readonly APP_VERSION="1.2.5"
+readonly APP_VERSION="1.2.4"
 readonly DATA_DIR="${HOME}/.warsailing"
 readonly LOG_DIR="${DATA_DIR}/logs"
 readonly BIN_DIR="${DATA_DIR}/bin"
@@ -42,7 +42,7 @@ command_exists() { command -v "$1" &>/dev/null; }
 
 require_root() {
     if [[ "$(id -u)" -ne 0 ]]; then
-        log_error "Dit script vereist root-rechten. Start met: sudo war-sailing of sudo ./install.sh"
+        log_error "This action requires root. Re-run with: sudo war-sailing of sudo $0"
         return 1
     fi
     return 0
@@ -64,32 +64,80 @@ print_banner() {
     ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝  ╚═╝    ╚══════╝╚═╝  ╚═╝╚═╝╚══════╝╚═╝╚═╝  ╚═══╝ ╚═════╝ 
 BANNER
         printf '%s\n' "${C_RESET}"
-        printf "%s          \"LETS EXPLORE THE 7 SEAS AND CONQUER FOR WALHALLA\"%s\n\n" "${C_STEEL}${C_BOLD}" "${C_RESET}"
+        printf "%s          \"LETS EXPLORE THE 7 SEA'S AND CONQUER FOR WALHALLA\"%s\n\n" "${C_STEEL}${C_BOLD}" "${C_RESET}"
+    else
+        (( cols < 40 )) && cols=40
+        printf '%s' "${C_OCEAN}"
+        printf '%*s\n' "$cols" '' | tr ' ' '='
+        
+        printf '%s' "${C_GOLD}${C_BOLD}"
+        local title="--- ${APP_NAME} v${APP_VERSION} ---"
+        printf "%*s\n" $(( (${#title} + cols) / 2 )) "$title"
+        
+        printf '%s' "${C_STEEL}"
+        local sub="WALHALLA IS AWAITING"
+        printf "%*s\n" $(( (${#sub} + cols) / 2 )) "$sub"
+        
+        printf '%s' "${C_OCEAN}"
+        printf '%*s\n' "$cols" '' | tr ' ' '='
+        printf '%s\n' "${C_RESET}"
     fi
 }
 
-detect_distro() { [[ -r /etc/os-release ]] && source /etc/os-release && echo "${ID:-unknown}" || echo "unknown"; }
+detect_distro() {
+    if [[ -r /etc/os-release ]]; then
+        source /etc/os-release
+        echo "${ID:-unknown}"
+    else
+        echo "unknown"
+    fi
+}
+
+assert_debian_based() {
+    local distro
+    distro=$(detect_distro)
+    case "$distro" in
+        debian|ubuntu|kali|raspbian) return 0 ;;
+        *)
+            log_warn "Unrecognized distro '${distro}' — continuing, but apt may fail."
+            ;;
+    esac
+}
 
 create_global_link() {
-    local script_path; script_path=$(realpath "$0")
+    log_info "Creating global system shortcut..."
+    local script_path
+    script_path=$(realpath "$0")
+    
     cat > "$SYSTEM_BIN" <<EOF
 #!/usr/bin/env bash
 exec "$script_path" "\$@"
 EOF
     chmod +x "$SYSTEM_BIN"
+    log_ok "Shortcut available! You can now just type: sudo war-sailing"
 }
 
 setup_python_venv() {
-    if [[ ! -d "$VENV_DIR" ]]; then python3 -m venv "$VENV_DIR"; fi
+    log_info "Setting up isolated Python environment..."
+    if [[ ! -d "$VENV_DIR" ]]; then
+        python3 -m venv "$VENV_DIR"
+    fi
     "${VENV_DIR}/bin/pip" install --upgrade pip --quiet
     "${VENV_DIR}/bin/pip" install --quiet scapy
+    log_ok "Python environment ready."
 }
 
 write_scan_engine() {
     mkdir -p "$BIN_DIR"
     cat > "$SCAN_ENGINE" <<'PYEOF'
 #!/usr/bin/env python3
-import sys, json, time, threading, subprocess, logging
+import sys
+import json
+import time
+import threading
+import subprocess
+import logging
+
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 from scapy.all import sniff, Dot11Beacon, Dot11ProbeResp, RadioTap, Dot11Elt
 
@@ -97,141 +145,447 @@ def channel_hopper(iface):
     channels = list(range(1, 14))
     idx = 0
     while True:
-        try: subprocess.run(["iw", "dev", iface, "set", "channel", str(channels[idx])], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except: pass
+        ch = channels[idx]
+        try:
+            subprocess.run(["iw", "dev", iface, "set", "channel", str(ch)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
         idx = (idx + 1) % len(channels)
         time.sleep(0.5)
 
 def get_ssid_and_channel(pkt, stats):
     ssid = stats.get("ssid") or ""
     channel = stats.get("channel") or 0
+    
     if not ssid or channel == 0:
         el = pkt[Dot11Elt]
         while el:
             if el.ID == 0:
                 try: ssid = el.info.decode('utf-8', errors='replace')
-                except: pass
+                except Exception: pass
             elif el.ID == 3:
                 try: channel = int(el.info[0])
-                except: pass
+                except Exception: pass
             el = el.payload.getlayer(Dot11Elt)
-    if isinstance(ssid, bytes): ssid = ssid.decode("utf-8", errors="replace")
+            
+    if isinstance(ssid, bytes):
+        ssid = ssid.decode("utf-8", errors="replace")
     return str(ssid), int(channel)
 
 def crypto_string(stats):
     crypto = stats.get("crypto")
-    return "[OPEN]" if not crypto else "[" + "-".join(sorted(str(c) for c in crypto)) + "]"
+    if not crypto:
+        return "[OPEN]"
+    return "[" + "-".join(sorted(str(c) for c in crypto)) + "]"
 
 def handle_packet(pkt):
-    if not (pkt.haslayer(Dot11Beacon) or pkt.haslayer(Dot11ProbeResp)): return
+    if not (pkt.haslayer(Dot11Beacon) or pkt.haslayer(Dot11ProbeResp)):
+        return
     layer = pkt[Dot11Beacon] if pkt.haslayer(Dot11Beacon) else pkt[Dot11ProbeResp]
+    
     try: stats = layer.network_stats()
-    except: stats = {}
+    except Exception: stats = {}
+
     bssid = pkt.addr2
     if not bssid: return
+
     ssid, channel = get_ssid_and_channel(pkt, stats)
+    
     rssi = -100
     if pkt.haslayer(RadioTap):
         signal = getattr(pkt[RadioTap], "dBm_AntSignal", None)
-        if signal is not None: rssi = int(signal)
-    record = {"bssid": bssid, "ssid": ssid, "channel": channel, "rssi": rssi, "auth": crypto_string(stats)}
+        if signal is not None:
+            rssi = int(signal)
+
+    record = {
+        "bssid": bssid,
+        "ssid": ssid,
+        "channel": channel,
+        "rssi": rssi,
+        "auth": crypto_string(stats),
+    }
     print(json.dumps(record), flush=True)
 
 def main():
-    if len(sys.argv) < 2: sys.exit(1)
+    if len(sys.argv) < 2:
+        sys.exit(1)
     iface = sys.argv[1]
-    threading.Thread(target=channel_hopper, args=(iface,), daemon=True).start()
-    try: sniff(iface=iface, prn=handle_packet, store=0)
-    except Exception as exc: sys.exit(1)
+    
+    hop_thread = threading.Thread(target=channel_hopper, args=(iface,), daemon=True)
+    hop_thread.start()
 
-if __name__ == "__main__": main()
+    try:
+        sniff(iface=iface, prn=handle_packet, store=0)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
 PYEOF
     chmod +x "$SCAN_ENGINE"
 }
 
 install_dependencies() {
-    require_root || return 1
+    require_root || die "Installation must be run as root (sudo $0 --install)."
+    assert_debian_based
+    log_info "Updating package index..."
     apt-get update -qq
-    apt-get install -y "${APT_PACKAGES[@]}"
+
+    local missing=()
+    for pkg in "${APT_PACKAGES[@]}"; do
+        if ! dpkg -s "$pkg" &>/dev/null; then missing+=("$pkg"); fi
+    done
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        log_ok "All required packages are present."
+    else
+        log_info "Installing required packages..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
+    fi
+
+    if command_exists dpkg-reconfigure; then
+        echo "wireshark-common wireshark-common/install-setuid boolean true" | debconf-set-selections
+        DEBIAN_FRONTEND=noninteractive dpkg-reconfigure wireshark-common &>/dev/null || true
+        usermod -aG wireshark "${SUDO_USER:-$USER}" 2>/dev/null || true
+    fi
+
     setup_python_venv
     write_scan_engine
     create_global_link
     mkdir -p "$LOG_DIR" "$STATE_DIR"
     touch "$INSTALL_MARKER"
-    log_ok "Setup voltooid."
+    log_ok "Setup complete."
 }
 
-detect_gps_devices() { for dev in /dev/ttyUSB* /dev/ttyACM*; do [[ -e "$dev" ]] && echo "$dev"; done; }
+update_tool() {
+    log_info "Checking tactical updates from GitHub..."
+    local dir
+    dir=$(dirname "$(realpath "$0")")
+    cd "$dir"
+    
+    if [[ ! -d .git ]]; then
+        log_error "This tool was not cloned via git. Cannot auto-update."
+        return 1
+    fi
+
+    git fetch --tags origin
+    local local_branch
+    local_branch=$(git rev-parse --abbrev-ref HEAD)
+    
+    log_info "Pulling newest code changes..."
+    if git pull origin "$local_branch"; then
+        log_ok "Code pulled successfully. Re-running core engines..."
+        write_scan_engine
+        create_global_link
+        log_ok "Update complete! Restating tactical interface..."
+        sleep 1
+        exec "$0" --run
+    else
+        log_error "Failed to pull data from GitHub. Verify your network link."
+    fi
+}
+
+detect_gps_devices() {
+    local devices=()
+    for dev in /dev/ttyUSB* /dev/ttyACM*; do
+        [[ -e "$dev" ]] && devices+=("$dev")
+    done
+    if [[ ${#devices[@]} -gt 0 ]]; then printf '%s\n' "${devices[@]}"; fi
+}
+
+ensure_gpsd_running() {
+    if pgrep -x gpsd &>/dev/null; then
+        log_ok "gpsd is running."
+        return 0
+    fi
+
+    local candidates=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && candidates+=("$line")
+    done < <(detect_gps_devices)
+
+    if [[ ${#candidates[@]} -eq 0 ]]; then
+        log_warn "No GPS hardware found. Logging with placeholder 0.0 coördinates."
+        return 1
+    fi
+
+    GPSD_DEVICE="${candidates[0]}"
+    log_info "Launching gpsd on ${GPSD_DEVICE}..."
+    gpsd -n "$GPSD_DEVICE" -F "${STATE_DIR}/gpsd.sock"
+    WE_STARTED_GPSD=1
+    sleep 1
+    return 0
+}
+
+stop_gpsd_if_we_started_it() {
+    if [[ "$WE_STARTED_GPSD" -eq 1 ]]; then
+        log_info "Terminating gpsd..."
+        pkill -x gpsd 2>/dev/null || true
+        WE_STARTED_GPSD=0
+    fi
+}
 
 get_gps_fix() {
-    local json; json=$(timeout 2 gpspipe -w -n 15 2>/dev/null | tr -d '\0' | grep -m1 '"class":"TPV"' || true)
-    json=$(echo -n "$json" | tr -cd '[:print:]')
-    if [[ -z "$json" ]]; then printf '%s' "SIGNAL_LOSS,SIGNAL_LOSS,0.0,0.0"; return; fi
-    local lat; lat=$(echo "$json" | jq -r '.lat // "SIGNAL_LOSS"')
-    local lon; lon=$(echo "$json" | jq -r '.lon // "SIGNAL_LOSS"')
-    local alt; alt=$(echo "$json" | jq -r '.alt // "0.0"')
-    local acc; acc=$(echo "$json" | jq -r '.epx // .eph // "0.0"')
+    local raw_json json lat lon alt acc
+    # Haal de rauwe data op en strip direct ALLES wat geen legitiem karakter is om Bash-waarschuwingen te voorkomen
+    raw_json=$(timeout 2 gpspipe -w -n 15 2>/dev/null | tr -d '\0' | grep -m1 '"class":"TPV"' || true)
+    
+    # Valideer string en zorg dat deze geen verborgen rotzooi bevat
+    json=$(echo -n "$raw_json" | tr -cd '[:print:]' || true)
+
+    if [[ -z "$json" ]]; then
+        printf '%s' "SIGNAL_LOSS,SIGNAL_LOSS,0.0,0.0"
+        return
+    fi
+
+    lat=$(echo "$json" | jq -r '.lat // "SIGNAL_LOSS"' 2>/dev/null | tr -d '\0')
+    lon=$(echo "$json" | jq -r '.lon // "SIGNAL_LOSS"' 2>/dev/null | tr -d '\0')
+    alt=$(echo "$json" | jq -r '.alt // "0.0"' 2>/dev/null | tr -d '\0')
+    acc=$(echo "$json" | jq -r '.epx // .eph // "0.0"' 2>/dev/null | tr -d '\0')
+
+    # Ultieme fallback-beveiliging tegen null-strings
+    [[ -z "$lat" || "$lat" == "null" ]] && lat="SIGNAL_LOSS"
+    [[ -z "$lon" || "$lon" == "null" ]] && lon="SIGNAL_LOSS"
+    [[ -z "$alt" || "$alt" == "null" ]] && alt="0.0"
+    [[ -z "$acc" || "$acc" == "null" ]] && acc="0.0"
+
     printf '%s,%s,%s,%s' "$lat" "$lon" "$alt" "$acc"
 }
 
-detect_wlan_interfaces() { iw dev | awk '$1=="Interface"{print $2}'; }
+detect_wlan_interfaces() {
+    iw dev 2>/dev/null | awk '$1=="Interface"{print $2}'
+}
 
-supports_monitor_mode() { iw phy "$(iw dev "$1" info | awk '/wiphy/{print "phy"$2}')" info | grep -qi monitor; }
+interface_phy() {
+    iw dev "$1" info 2>/dev/null | awk '/wiphy/{print "phy"$2}'
+}
+
+supports_monitor_mode() {
+    local iface="$1" phy
+    phy=$(interface_phy "$iface")
+    [[ -z "$phy" ]] && return 1
+    iw phy "$phy" info 2>/dev/null | awk '/Supported interface modes/{f=1;next} /^\t\t\*/{if(f)print} /^\t[A-Z]/{f=0}' | grep -qi monitor
+}
 
 select_wlan_interface() {
-    local ifaces=(); while IFS= read -r line; do [[ -n "$line" ]] && ifaces+=("$line"); done < <(detect_wlan_interfaces)
-    [[ ${#ifaces[@]} -eq 0 ]] && { log_error "Geen interfaces gevonden."; return 1; }
-    echo -e "${C_GOLD}Selecteer de interface voor de expeditie:${C_RESET}" >&2
-    local choice; select choice in "${ifaces[@]}"; do [[ -n "$choice" ]] && { echo "$choice"; return 0; }; done
+    local ifaces=()
+    while IFS= read -r line; do [[ -n "$line" ]] && ifaces+=("$line"); done < <(detect_wlan_interfaces)
+    if [[ ${#ifaces[@]} -eq 0 ]]; then log_error "No wireless interface detected."; return 1; fi
+
+    echo -e "${C_GOLD}Select the tactical interface for this expedition:${C_RESET}" >&2
+    local choice
+    select choice in "${ifaces[@]}"; do
+        if [[ -n "$choice" ]]; then echo "$choice"; return 0; fi
+    done
 }
 
 enable_monitor_mode() {
     local iface="$1"
+    if command_exists airmon-ng; then
+        airmon-ng check kill &>/dev/null || true
+        airmon-ng start "$iface" &>/dev/null || true
+        local mon
+        mon=$(iw dev 2>/dev/null | awk '/Interface/{print $2}' | grep -i "^${iface}mon" || true)
+        if [[ -n "$mon" ]]; then echo "$mon"; return 0; fi
+    fi
     ip link set "$iface" down
-    iw dev "$iface" set type monitor || airmon-ng start "$iface"
+    iw dev "$iface" set type monitor
     ip link set "$iface" up
     echo "$iface"
 }
 
 disable_monitor_mode() {
-    local mon="$1"
-    ip link set "$mon" down
-    iw dev "$mon" set type managed || airmon-ng stop "$mon"
-    ip link set "$mon" up
+    local mon_iface="$1"
+    if command_exists airmon-ng && [[ "$mon_iface" == *mon ]]; then
+        airmon-ng stop "$mon_iface" &>/dev/null || true
+        systemctl restart NetworkManager &>/dev/null || service NetworkManager restart &>/dev/null || true
+        return 0
+    fi
+    ip link set "$mon_iface" down 2>/dev/null || true
+    iw dev "$mon_iface" set type managed 2>/dev/null || true
+    ip link set "$mon_iface" up 2>/dev/null || true
+}
+
+init_log_file() {
+    mkdir -p "$LOG_DIR"
+    CURRENT_LOG_FILE="${LOG_DIR}/wardrive_$(date +"%Y%m%d_%H%M%S").csv"
+    {
+        echo "WigleWifi-1.6,appRelease=${APP_VERSION},model=WarSailing,release=Linux,device=$(hostname),display=cli,board=generic,brand=WarSailing"
+        echo "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type"
+    } > "$CURRENT_LOG_FILE"
+    log_ok "Sails high. Writing logs to ${CURRENT_LOG_FILE}"
 }
 
 run_loot_feed() {
-    local iface="$1"; clear
-    echo -e "${C_OCEAN}=== LOOT FEED (Ctrl+C om te stoppen) ===${C_RESET}"
-    SEEN_BSSIDS=(); SCAN_COUNT=0
-    while IFS= read -r raw; do
-        local line; line=$(echo -n "$raw" | tr -cd '[:print:]')
+    local iface="$1"
+    clear
+    echo -e "${C_OCEAN}${C_BOLD}================== THE LOOT FEED ==================${C_RESET}"
+    echo -e "${C_STEEL}Interface: ${C_GOLD}${iface}${C_STEEL}  |  Press ${C_BLOOD}Ctrl+C${C_STEEL} to drop anchor & secure camp${C_RESET}"
+    echo -e "${C_OCEAN}====================================================${C_RESET}"
+
+    SEEN_BSSIDS=()
+    SCAN_COUNT=0
+
+    # Stream opschonen van alle verborgen null-bytes of non-printable karakters
+    while IFS= read -r raw_line; do
+        local line
+        line=$(echo -n "$raw_line" | tr -cd '[:print:]' || true)
         [[ -z "$line" ]] && continue
-        local bssid; bssid=$(echo "$line" | jq -r '.bssid')
+        
+        local bssid ssid channel rssi auth
+        bssid=$(echo "$line" | jq -r '.bssid // empty' 2>/dev/null)
+        [[ -z "$bssid" ]] && continue
         [[ -n "${SEEN_BSSIDS[$bssid]:-}" ]] && continue
-        SEEN_BSSIDS[$bssid]=1; SCAN_COUNT=$((SCAN_COUNT + 1))
-        local lat lon alt acc; IFS=',' read -r lat lon alt acc <<< "$(get_gps_fix)"
-        printf '%s,"%s",%s,%s,%s,%s,%s,%s,%s,%s,WIFI\n' "$bssid" "$(echo "$line" | jq -r '.ssid')" "$(echo "$line" | jq -r '.auth')" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$(echo "$line" | jq -r '.channel')" "$(echo "$line" | jq -r '.rssi')" "$lat" "$lon" "$alt" "$acc" >> "$CURRENT_LOG_FILE"
-        printf "${C_GOLD}%-14.14s${C_RESET} rssi:%s\n" "$(echo "$line" | jq -r '.ssid')" "$(echo "$line" | jq -r '.rssi')"
+        SEEN_BSSIDS[$bssid]=1
+        SCAN_COUNT=$((SCAN_COUNT + 1))
+
+        ssid=$(echo "$line" | jq -r '.ssid // ""' 2>/dev/null | tr -cd '[:print:]')
+        channel=$(echo "$line" | jq -r '.channel // 0' 2>/dev/null)
+        rssi=$(echo "$line" | jq -r '.rssi // -100' 2>/dev/null)
+        auth=$(echo "$line" | jq -r '.auth // "[UNKNOWN]"' 2>/dev/null)
+
+        # Haal de schone GPS-data op
+        local lat lon alt acc gps_fix
+        gps_fix=$(get_gps_fix)
+        IFS=',' read -r lat lon alt acc <<< "$gps_fix"
+
+        # Schrijf netjes naar de WigleCSV (als er geen signaal is, zetten we 0.0 neer om de kaart te sparen)
+        local log_lat="$lat" log_lon="$lon"
+        if [[ "$lat" == "SIGNAL_LOSS" || "$lon" == "SIGNAL_LOSS" ]]; then
+            log_lat="0.000000"
+            log_lon="0.000000"
+        fi
+
+        printf '%s,"%s",%s,%s,%s,%s,%s,%s,%s,%s,WIFI\n' "$bssid" "$ssid" "$auth" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$channel" "$rssi" "$log_lat" "$log_lon" "$alt" "$acc" >> "$CURRENT_LOG_FILE"
+
+        local rssi_color="$C_STEEL"
+        if   (( rssi >= -50 )); then rssi_color="$C_GREEN"
+        elif (( rssi >= -70 )); then rssi_color="$C_GOLD"
+        else                          rssi_color="$C_BLOOD"
+        fi
+
+        # Dynamische weergave in de cockpit: toon SIGNAL LOSS als de coördinaten corrupt waren
+        local gps_display
+        if [[ "$lat" == "SIGNAL_LOSS" ]]; then
+            gps_display="${C_BLOOD}[SIGNAL LOSS]${C_RESET}"
+        else
+            gps_display="${C_GREEN}Fix: ${lat:0:7},${lon:0:7}${C_RESET}"
+        fi
+
+        printf "${C_OCEAN}[%4d]${C_RESET} ${C_GOLD}%-14.14s${C_RESET} ${C_STEEL}%s${C_RESET} ch:${C_FOAM}%-2s${C_RESET} %s\n" \
+            "$SCAN_COUNT" "${ssid:-<hidden>}" "$bssid" "$channel" "$gps_display"
     done < <("${VENV_DIR}/bin/python3" "$SCAN_ENGINE" "$iface" 2>/dev/null)
+}
+
+expedition_cleanup() {
+    local mon_iface="$1"
+    [[ "$CLEANED_UP" -eq 1 ]] && return 0
+    CLEANED_UP=1
+    echo
+    log_info "Securing the ship and sails..."
+    disable_monitor_mode "$mon_iface"
+    stop_gpsd_if_we_started_it
+    log_ok "Expedition terminated safely. Networks captured: ${SCAN_COUNT}"
+}
+
+menu_start_expedition() {
+    require_root || return 0
+    local iface mon_iface
+    iface=$(select_wlan_interface) || return 0
+
+    ensure_gpsd_running || true
+    mon_iface=$(enable_monitor_mode "$iface")
+    init_log_file
+
+    CLEANED_UP=0
+    trap 'expedition_cleanup "'"$mon_iface"'"; printf "\n%sFair winds, Viking. Walhalla awaits.%s\n" "${C_GOLD}${C_BOLD}" "${C_RESET}"; exit 0' INT TERM
+    run_loot_feed "$mon_iface"
+    expedition_cleanup "$mon_iface"
+    trap - INT TERM
+    read -rp "Press Enter to return to camp..." _ || true
+}
+
+menu_stop_and_secure() {
+    require_root || return 0
+    log_info "Inspecting active rigging..."
+    local found=0 iface mode
+    while IFS= read -r iface; do
+        [[ -z "$iface" ]] && continue
+        mode=$(iw dev "$iface" info 2>/dev/null | awk '/type/{print $2}')
+        if [[ "$mode" == "monitor" ]]; then
+            log_warn "Restoring ${iface} to normal state..."
+            disable_monitor_mode "$iface"
+            found=1
+        fi
+    done < <(detect_wlan_interfaces)
+
+    if pgrep -x gpsd &>/dev/null; then
+        pkill -x gpsd 2>/dev/null || true
+        found=1
+    fi
+    [[ "$found" -eq 0 ]] && log_ok "Ship already secured." || log_ok "All hardware released."
+}
+
+menu_view_logs() {
+    mkdir -p "$LOG_DIR"
+    local files=()
+    while IFS= read -r f; do [[ -n "$f" ]] && files+=("$f"); done < <(ls -1t "${LOG_DIR}"/*.csv 2>/dev/null || true)
+    if [[ ${#files[@]} -eq 0 ]]; then log_warn "No logs found."; return 0; fi
+
+    echo -e "${C_GOLD}${C_BOLD}Saved expeditions:${C_RESET}"
+    local i=1 count f_date
+    for f in "${files[@]}"; do
+        count=$(( $(wc -l < "$f") - 2 ))
+        (( count < 0 )) && count=0
+        f_date=$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "unknown")
+        printf "  %s[%2d]%s %-24s ${C_STEEL}(%d APs)${C_RESET}\n" "$C_OCEAN_LT" "$i" "$C_RESET" "$(basename "$f")" "$count"
+        i=$((i + 1))
+    done
+
+    echo
+    local choice
+    read -rp "$(printf '%sSelect a number to view, or press Enter to slip away: %s' "$C_GOLD" "$C_RESET")" choice || true
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#files[@]} )); then
+        head -n 12 "${files[$((choice - 1))]}"
+        echo
+        read -rp "Press Enter to return..." _ || true
+    fi
 }
 
 main_menu() {
     while true; do
         print_banner
-        echo -e "[1] Start Expedition\n[2] Stop & Secure\n[3] View Logs\n[4] Update\n[5] Exit"
-        read -rp "Keuze: " choice
+        echo -e "  ${C_OCEAN_LT}${C_BOLD}[1]${C_RESET} Start Expedition (Scan)"
+        echo -e "  ${C_OCEAN_LT}${C_BOLD}[2]${C_RESET} Stop & Secure Sails"
+        echo -e "  ${C_OCEAN_LT}${C_BOLD}[3]${C_RESET} View Saved Logs"
+        echo -e "  ${C_OCEAN_LT}${C_BOLD}[4]${C_RESET} Update Tool from GitHub"
+        echo -e "  ${C_OCEAN_LT}${C_BOLD}[5]${C_RESET} Exit"
+        echo
+        local choice
+        read -rp "$(printf '%sChoose your fate, Viking: %s' "$C_GOLD" "$C_RESET")" choice || choice=5
         case "$choice" in
-            1) local iface; iface=$(select_wlan_interface); CURRENT_LOG_FILE="${LOG_DIR}/wardrive_$(date +%Y%m%d_%H%M%S).csv"; local mon; mon=$(enable_monitor_mode "$iface"); trap 'disable_monitor_mode "$mon"; exit' INT; run_loot_feed "$mon"; disable_monitor_mode "$mon";;
-            2) log_info "Beveiliging actief.";;
-            3) ls -lh "$LOG_DIR";;
-            4) git pull;;
-            5) exit 0;;
+            1) menu_start_expedition ;;
+            2) menu_stop_and_secure; read -rp "Press Enter to continue..." _ || true ;;
+            3) menu_view_logs ;;
+            4) update_tool; read -rp "Press Enter to continue..." _ || true ;;
+            5) log_info "Fair winds. Walhalla awaits."; exit 0 ;;
+            *) log_warn "Invalid selection."; sleep 1 ;;
         esac
     done
 }
 
-case "${1:-}" in
-    --install) install_dependencies;;
-    *) main_menu;;
-esac
+main() {
+    mkdir -p "$DATA_DIR" "$LOG_DIR" "$STATE_DIR" "$BIN_DIR"
+    case "${1:-}" in
+        --install) print_banner; install_dependencies; exit 0 ;;
+        --update) update_tool; exit 0 ;;
+        --run) : ;;
+        -h|--help) print_banner; echo "Usage: $0 [--install | --update | --run | --help]"; exit 0 ;;
+        "") if [[ ! -f "$INSTALL_MARKER" ]]; then print_banner; log_warn "First launch: deploying dependencies."; install_dependencies; fi ;;
+        *) echo "Usage: $0 [--install | --update | --run]"; exit 1 ;;
+    esac
+    main_menu
+}
+
+main "$@"
